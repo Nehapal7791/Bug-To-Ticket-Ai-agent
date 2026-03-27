@@ -1,10 +1,24 @@
 import subprocess
 import json
-import os
 import tempfile
 from pathlib import Path
 
 RESULTS_PATH = Path("reports/latest_run.json")
+EXECUTED_SCRIPTS_DIR = Path("tests/generated/executed")
+
+
+def _run_python_script(script: str, timeout: int) -> dict:
+    result = subprocess.run(
+        ["python", "-c", script],
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
+    return {
+        "stdout": result.stdout,
+        "stderr": result.stderr,
+        "returncode": result.returncode,
+    }
 
 
 def run_playwright_script(script: str) -> dict:
@@ -14,16 +28,24 @@ def run_playwright_script(script: str) -> dict:
     """
     # Ensure reports dir exists
     RESULTS_PATH.parent.mkdir(exist_ok=True)
+    EXECUTED_SCRIPTS_DIR.mkdir(parents=True, exist_ok=True)
+
+    if RESULTS_PATH.exists():
+        RESULTS_PATH.unlink()
 
     # Inject result collection wrapper into script
     wrapped_script = _wrap_script(script)
 
-    # Write to temp file
+    script_path = None
+    executed_script_path = None
+
+    # Write wrapped script to reusable debug artifact
     with tempfile.NamedTemporaryFile(
-        mode="w", suffix=".py", delete=False, dir="tests/generated"
+        mode="w", suffix=".py", delete=False, dir=str(EXECUTED_SCRIPTS_DIR)
     ) as f:
         f.write(wrapped_script)
-        script_path = f.name
+        executed_script_path = f.name
+        script_path = executed_script_path
 
     try:
         result = subprocess.run(
@@ -36,29 +58,42 @@ def run_playwright_script(script: str) -> dict:
         # Try to parse JSON results from stdout
         if RESULTS_PATH.exists():
             with open(RESULTS_PATH) as rf:
-                return json.load(rf)
+                data = json.load(rf)
+            if data.get("total", 0) == 0:
+                return {
+                    **data,
+                    "status": "EXECUTION_ERROR",
+                    "error": "Generated script ran without recording any tests.",
+                    "executed_script_path": executed_script_path,
+                    "raw_stdout": result.stdout[-2000:],
+                    "raw_stderr": result.stderr[-2000:],
+                }
+            return {
+                **data,
+                "executed_script_path": executed_script_path,
+                "raw_stdout": result.stdout[-2000:],
+                "raw_stderr": result.stderr[-2000:],
+            }
 
         # Fallback: parse from stdout
-        return _parse_output(result.stdout, result.stderr, result.returncode)
+        fallback = _parse_output(result.stdout, result.stderr, result.returncode)
+        fallback["executed_script_path"] = executed_script_path
+        return fallback
 
     except subprocess.TimeoutExpired:
         return {
             "status": "TIMEOUT",
             "error": "Script exceeded 120s timeout",
             "tests": [],
+            "executed_script_path": executed_script_path,
         }
     except Exception as e:
         return {
             "status": "EXECUTION_ERROR",
             "error": str(e),
             "tests": [],
+            "executed_script_path": executed_script_path,
         }
-    finally:
-        # Clean up temp file
-        try:
-            os.unlink(script_path)
-        except Exception:
-            pass
 
 
 def capture_dom_snapshot(url: str) -> str:
@@ -97,55 +132,57 @@ async def main():
 asyncio.run(main())
 """
     try:
-        result = subprocess.run(
-            ["python", "-c", snapshot_script],
-            capture_output=True, text=True, timeout=30
-        )
-        return result.stdout.strip()
+        result = _run_python_script(snapshot_script, timeout=30)
+        return result["stdout"].strip()
     except Exception as e:
         return f"DOM capture failed: {e}"
 
 
 def _wrap_script(script: str) -> str:
     """Wrap the generated script to write JSON results."""
-    wrapper_header = f"""
+    sanitized_script = script.replace("def _record(", "def _model_defined_record(")
+    wrapper_header = """
 import json, sys, traceback
 from pathlib import Path
 
 _results = []
 _errors  = []
 
-def _record(name, passed, error=None, details=None):
-    _results.append({{
+def __cascade_record(name, passed, error=None, details=None):
+    _results.append({
         "name": name,
         "passed": passed,
         "error": error,
         "details": details or "",
-    }})
+    })
+
+_record = __cascade_record
 
 """
-    wrapper_footer = f"""
+    wrapper_footer = """
 
 # ── Save results ──────────────────────────────────────────────
-_output = {{
-    "status": "PASS" if all(r["passed"] for r in _results) else "FAIL",
+_output = {
+    "status": "PASS" if _results and all(r["passed"] for r in _results) else ("FAIL" if _results else "EXECUTION_ERROR"),
     "total": len(_results),
     "passed": sum(1 for r in _results if r["passed"]),
     "failed": sum(1 for r in _results if not r["passed"]),
     "tests": _results,
-}}
+    "error": None if _results else "No tests were recorded by the generated script.",
+}
 Path("reports/latest_run.json").write_text(json.dumps(_output, indent=2))
 """
-    return wrapper_header + script + wrapper_footer
+    return wrapper_header + sanitized_script + wrapper_footer
 
 
 def _parse_output(stdout: str, stderr: str, returncode: int) -> dict:
     return {
-        "status": "PASS" if returncode == 0 else "FAIL",
+        "status": "EXECUTION_ERROR" if returncode == 0 else "FAIL",
         "total": 0,
         "passed": 0,
         "failed": 0 if returncode == 0 else 1,
         "tests": [],
+        "error": "Script finished without producing structured test results." if returncode == 0 else "Generated script failed during execution.",
         "raw_stdout": stdout[-2000:],
         "raw_stderr": stderr[-2000:],
     }

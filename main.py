@@ -11,6 +11,7 @@ Usage:
 
 import argparse
 import json
+import os
 import sys
 import time
 from datetime import datetime
@@ -23,17 +24,17 @@ from rich.text import Text
 from rich import box
 
 from graph.graph_builder import build_graph
-from config import APP_BASE_URL
+from config import APP_BASE_URL, APP_VERTICAL_NAME, APP_PROJECT_NAME
 
 console = Console()
 
 NODE_LABELS = {
     "fetch_ticket":   "📋  Fetching Jira ticket",
     "analyze_risk":   "🔍  Analyzing risk",
+    "inspect_app":    "🧭  Inspecting live app",
     "gen_tests":      "✍️   Generating test cases",
     "run_playwright": "🎭  Running Playwright tests",
     "detect_bugs":    "🐛  Detecting bugs",
-    "self_heal":      "🔧  Self-healing selectors",
     "log_bugs":       "📝  Logging bugs to Jira",
     "summarize":      "📊  Generating report",
 }
@@ -42,7 +43,7 @@ NODE_LABELS = {
 def print_banner():
     console.print(Panel.fit(
         "[bold cyan]AI QA AGENT[/bold cyan]  [dim]powered by LangGraph + Groq (llama3)[/dim]\n"
-        "[dim]Test Generation · Playwright · Self-Healing · Jira Integration[/dim]",
+        "[dim]Test Generation · ReAct Agent · Browser Toolkit · Jira Integration[/dim]",
         border_style="cyan"
     ))
 
@@ -60,11 +61,15 @@ def print_state_update(node_name: str, state: dict):
         color = {"HIGH": "red", "MEDIUM": "yellow", "LOW": "green"}.get(level, "white")
         console.print(f"    [dim]→ Risk Level: [{color}]{level}[/{color}][/dim]")
 
+    elif node_name == "inspect_app":
+        if state.get("inspection_summary"):
+            console.print(f"    [dim]→ {state.get('inspection_summary', '').splitlines()[0]}[/dim]")
+        if state.get("inspection_artifacts_path"):
+            console.print(f"    [dim]→ Inspection artifact: {state.get('inspection_artifacts_path')}[/dim]")
+
     elif node_name == "gen_tests":
         count = len(state.get("test_cases", []))
-        retry = state.get("retry_count", 0)
-        tag   = f" [yellow](retry #{retry})[/yellow]" if retry > 0 else ""
-        console.print(f"    [dim]→ Generated {count} test cases{tag}[/dim]")
+        console.print(f"    [dim]→ Generated {count} test cases[/dim]")
 
     elif node_name == "run_playwright":
         results = state.get("test_results", [])
@@ -72,9 +77,8 @@ def print_state_update(node_name: str, state: dict):
         passed = sum(1 for r in results if r.get("passed"))
         failed = total - passed
         console.print(f"    [dim]→ {total} tests: [green]{passed} passed[/green] / [red]{failed} failed[/red][/dim]")
-
-    elif node_name == "self_heal":
-        console.print(f"    [yellow]→ Selector issues detected — regenerating with DOM context...[/yellow]")
+        if state.get("execution_error"):
+            console.print(f"    [yellow]→ Execution error: {state.get('execution_error')}[/yellow]")
 
     elif node_name == "detect_bugs":
         bugs = state.get("bugs", [])
@@ -156,12 +160,11 @@ def print_final_report(state: dict):
         f"  [bold]Ticket:[/bold] {state.get('ticket_id')}  "
         f"[bold]Tests:[/bold] {total}  "
         f"[bold]Passed:[/bold] [green]{passed}[/green]  "
-        f"[bold]Bugs:[/bold] [red]{len(bugs)}[/red]  "
-        f"[bold]Retries:[/bold] {state.get('retry_count', 0)}"
+        f"[bold]Bugs:[/bold] [red]{len(bugs)}[/red]"
     )
 
 
-def run_agent(ticket_id: str, app_url: str):
+def run_agent(ticket_id: str, app_url: str, username: str | None = None, password: str | None = None):
     print_banner()
     console.print(f"\n[bold]Running QA Agent[/bold] for ticket [cyan]{ticket_id}[/cyan]\n")
 
@@ -170,6 +173,12 @@ def run_agent(ticket_id: str, app_url: str):
     initial_state: dict = {
         "ticket_id":                  ticket_id,
         "app_url":                    app_url,
+        "username":                   username,
+        "password":                   password,
+        "vertical_name":              APP_VERTICAL_NAME,
+        "project_name":               APP_PROJECT_NAME,
+        "inspection_summary":         None,
+        "inspection_artifacts_path":  None,
         "ticket_summary":             "",
         "ticket_description":         "",
         "ticket_acceptance_criteria": "",
@@ -179,11 +188,12 @@ def run_agent(ticket_id: str, app_url: str):
         "playwright_script":          "",
         "test_results":               [],
         "execution_error":            None,
+        "generated_script_path":      None,
+        "executed_script_path":       None,
+        "execution_stdout":           None,
+        "execution_stderr":           None,
         "bugs":                       [],
-        "is_selector_issue":          False,
         "jira_bug_links":             [],
-        "retry_count":                0,
-        "dom_snapshot":               None,
         "summary":                    "",
     }
 
@@ -200,9 +210,14 @@ def run_agent(ticket_id: str, app_url: str):
 
     # Save full report
     report_path = f"reports/{ticket_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+    os.makedirs("reports", exist_ok=True)
     with open(report_path, "w") as f:
         # Remove non-serializable fields
-        safe_state = {k: v for k, v in final_state.items() if isinstance(v, (str, int, bool, list, dict, type(None)))}
+        safe_state = {
+            k: v
+            for k, v in final_state.items()
+            if k not in {"username", "password"} and isinstance(v, (str, int, bool, list, dict, type(None)))
+        }
         json.dump(safe_state, f, indent=2)
 
     console.print(f"\n  [dim]Full report saved → {report_path}[/dim]\n")
@@ -212,10 +227,12 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="AI QA Agent — LangGraph + GPT-4o-mini")
     parser.add_argument("--ticket", required=True, help="Jira ticket ID, e.g. QA-42")
     parser.add_argument("--app",    default=APP_BASE_URL, help="App URL to test against")
+    parser.add_argument("-u", "--username", help="Login username or email for the app under test")
+    parser.add_argument("-p", "--password", help="Login password for the app under test")
     args = parser.parse_args()
 
     try:
-        run_agent(args.ticket, args.app)
+        run_agent(args.ticket, args.app, args.username, args.password)
     except KeyboardInterrupt:
         console.print("\n[yellow]Interrupted.[/yellow]")
         sys.exit(0)

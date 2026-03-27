@@ -4,7 +4,14 @@ from graph.state import QAState
 from config import GROQ_MODEL
 import json
 
-llm = ChatGroq(model=GROQ_MODEL, temperature=0.4)
+llm = None
+
+
+def get_llm():
+    global llm
+    if llm is None:
+        llm = ChatGroq(model=GROQ_MODEL, temperature=0.4)
+    return llm
 
 
 def summarize_node(state: QAState) -> QAState:
@@ -37,7 +44,7 @@ Write a clear 3-paragraph executive summary:
 
 Be concise and professional."""
 
-    response = llm.invoke([
+    response = get_llm().invoke([
         SystemMessage(content="You are a QA lead writing executive reports."),
         HumanMessage(content=prompt),
     ])

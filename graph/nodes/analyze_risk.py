@@ -4,7 +4,14 @@ from graph.state import QAState
 from config import GROQ_MODEL
 import json
 
-llm = ChatGroq(model=GROQ_MODEL, temperature=0.2)
+llm = None
+
+
+def get_llm():
+    global llm
+    if llm is None:
+        llm = ChatGroq(model=GROQ_MODEL, temperature=0.2)
+    return llm
 
 
 def analyze_risk_node(state: QAState) -> QAState:
@@ -29,7 +36,7 @@ Analyze this ticket and respond ONLY with a JSON object:
   "security_concerns": ["any", "security", "risks"]
 }}"""
 
-    response = llm.invoke([
+    response = get_llm().invoke([
         SystemMessage(content="You are a QA risk analysis expert. Respond only with valid JSON."),
         HumanMessage(content=prompt),
     ])

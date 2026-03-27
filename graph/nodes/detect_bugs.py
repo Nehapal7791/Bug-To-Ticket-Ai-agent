@@ -4,20 +4,27 @@ from graph.state import QAState
 from config import GROQ_MODEL
 import json
 
-llm = ChatGroq(model=GROQ_MODEL, temperature=0.1)
+llm = None
+
+
+def get_llm():
+    global llm
+    if llm is None:
+        llm = ChatGroq(model=GROQ_MODEL, temperature=0.1)
+    return llm
 
 
 def detect_bugs_node(state: QAState) -> QAState:
     """
     NODE 5: Classify test failures.
     - Real bugs → log to Jira
-    - Selector/infra issues → trigger self-heal retry
+    - All infrastructure issues are now handled by the ReAct agent internally
     """
     test_results  = state.get("test_results", [])
     failed_tests  = [t for t in test_results if not t.get("passed")]
 
     if not failed_tests:
-        return {**state, "bugs": [], "is_selector_issue": False}
+        return {**state, "bugs": []}
 
     prompt = f"""You are a QA bug analyst. Classify these test failures.
 
@@ -31,6 +38,10 @@ For each failure, determine:
 1. Is this a REAL APPLICATION BUG or a TEST INFRASTRUCTURE issue?
    - Real bugs: wrong behavior, wrong content, HTTP errors, logic failures
    - Infrastructure: element not found, selector timeout, network timeout, wrong URL
+   
+Note: Infrastructure issues are now handled internally by the ReAct agent, 
+so only classify as INFRASTRUCTURE if it's clearly not an application bug.
+Real bugs should be logged to Jira.
 
 Respond ONLY with JSON:
 {{
@@ -43,15 +54,13 @@ Respond ONLY with JSON:
       "title": "short bug title",
       "description": "detailed description with steps to reproduce",
       "expected": "expected behavior",
-      "actual": "actual behavior",
-      "selector_issue": false
+      "actual": "actual behavior"
     }}
   ],
-  "has_selector_issues": true | false,
   "has_real_bugs": true | false
 }}"""
 
-    response = llm.invoke([
+    response = get_llm().invoke([
         SystemMessage(content="You are a QA bug classifier. Respond only with valid JSON."),
         HumanMessage(content=prompt),
     ])
@@ -62,18 +71,12 @@ Respond ONLY with JSON:
     except Exception:
         data = {
             "bugs": [],
-            "has_selector_issues": True,
             "has_real_bugs": False,
         }
 
-    real_bugs        = [b for b in data.get("bugs", []) if b.get("bug_type") == "REAL_BUG"]
-    has_sel_issues   = data.get("has_selector_issues", False)
-    retry_count      = state.get("retry_count", 0)
-    from config import MAX_SELF_HEAL_RETRIES
-    should_self_heal = has_sel_issues and not data.get("has_real_bugs") and retry_count < MAX_SELF_HEAL_RETRIES
+    real_bugs = [b for b in data.get("bugs", []) if b.get("bug_type") == "REAL_BUG"]
 
     return {
         **state,
-        "bugs":             real_bugs,
-        "is_selector_issue": should_self_heal,
+        "bugs": real_bugs,
     }
